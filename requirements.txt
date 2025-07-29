@@ -7,3 +7,4 @@ pydantic
 fastapi
 uvicorn
 requests
+langchain-community
