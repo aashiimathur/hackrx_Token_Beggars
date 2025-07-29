@@ -64,7 +64,7 @@ def process_documents(file_url, chunk_size=1000):
 async def run_hackrx(request: RequestBody, authorization: Optional[str] = Header(None)):
     # Only enforce authentication in production
     if os.getenv("ENV", "dev") == "prod":
-        if not authorization or authorization != f"Bearer {os.getenv('API_KEY')}":
+        if not authorization or authorization != f"{os.getenv('OPENAI_API_KEY')}":
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     vectorstore = process_documents(request.documents)
