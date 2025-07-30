@@ -1,11 +1,10 @@
 python-dotenv
-langchain
 openai
-langchain-openai
 faiss-cpu
 pydantic
 fastapi
 uvicorn
 requests
-langchain-community
-pypdf
+httpx
+PyMuPDF
+numpy
