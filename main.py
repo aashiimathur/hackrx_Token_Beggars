@@ -1,99 +1,154 @@
-from dotenv import load_dotenv
-import os
-import tempfile
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    UnstructuredWordDocumentLoader,
-    TextLoader
-)
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import requests
-from typing import Optional
+import httpx
+import fitz  # PyMuPDF
+from openai import OpenAI
+import os
+from dotenv import load_dotenv
+from typing import List
+import numpy as np
+import faiss
+import json
 
+# ---- Load OpenAI Key ----
 load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 app = FastAPI()
+faiss_cache = {}
 
-class RequestBody(BaseModel):
+# ---- Auth Token ----
+TEAM_TOKEN = "57d17fb3fd51f0068152497c4528563c4fefeee343ee094e4f2fe34b6b9cf096"
+
+# ---- Data Models ----
+class QueryRequest(BaseModel):
     documents: str
-    questions: list[str]
+    questions: List[str]
 
-def process_documents(file_url, chunk_size=1000):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        file_name = file_url.split("?")[0].split("/")[-1]
-        file_path = os.path.join(temp_dir, file_name)
+class QueryResponse(BaseModel):
+    answers: List[str]
 
-        response = requests.get(file_url)
-        if response.status_code != 200:
-            raise ValueError("Failed to download document")
-        with open(file_path, "wb") as f:
+# ---- PDF Downloader ----
+async def download_pdf_text(url: str) -> str:
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+        response.raise_for_status()
+        with open("temp.pdf", "wb") as f:
             f.write(response.content)
+        doc = fitz.open("temp.pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text.strip()
+    except Exception as e:
+        raise Exception(f"Download or extraction failed: {str(e)}")
 
-        docs = []
-        if file_path.endswith(".pdf"):
-            loader = PyPDFLoader(file_path)
-            loaded_docs = loader.load()
-            for doc in loaded_docs:
-                doc.metadata["exact_location"] = f"Page {doc.metadata.get('page', 'N/A')}"
-            docs.extend(loaded_docs)
-        elif file_path.endswith(".docx"):
-            loader = UnstructuredWordDocumentLoader(file_path)
-            docs.extend(loader.load())
-        elif file_path.endswith(".txt"):
-            loader = TextLoader(file_path)
-            docs.extend(loader.load())
-        else:
-            raise ValueError("Unsupported file type")
+# ---- Chunking ----
+def split_text_into_chunks(text: str, chunk_size: int = 300, overlap: int = 50) -> List[str]:
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i + chunk_size]
+        chunks.append(" ".join(chunk))
+        i += chunk_size - overlap if i + chunk_size < len(words) else len(words)
+    return chunks
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            separators=["\n\n", "\n", ".", " "],
-            chunk_size=chunk_size,
-            chunk_overlap=200,
-        )
-        splits = text_splitter.split_documents(docs)
-        embeddings = OpenAIEmbeddings()
-        return FAISS.from_documents(splits, embeddings)
-    
-@app.post("/hackrx/run")
-async def run_hackrx(request: RequestBody, authorization: Optional[str] = Header(None)):
-    # Only enforce authentication in production
-    if os.getenv("ENV", "dev") == "prod":
-        if not authorization or authorization != f"Bearer {os.getenv('API_KEY')}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-    vectorstore = process_documents(request.documents)
-
-    prompt_template = """You are an insurance claim assistant.
-    Use the following context to answer the question.
-    - Quote exact phrases.
-    - Cite source name and location.
-    - Reply in JSON with Decision (approved/rejected), Amount(if applicable), Justification, and Confidence Score.
-
-    {context}
-
-    Question: {question}
-    Answer:"""
-
-    QA_PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    llm = ChatOpenAI(temperature=0.3, max_tokens=500, model_name="gpt-4.1-nano-2025-04-14")
-
-    qa_chain = RetrievalQA.from_chain_type(
-        llm,
-        chain_type="stuff",
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 2}),
-        chain_type_kwargs={"prompt": QA_PROMPT},
-        return_source_documents=True,
+# ---- Embeddings ----
+def get_embeddings(texts: List[str]) -> List[List[float]]:
+    response = client.embeddings.create(
+        model="text-embedding-3-large",
+        input=texts
     )
+    embeddings = []
+    for e in response.data:
+        vec = np.array(e.embedding, dtype="float32")
+        vec /= np.linalg.norm(vec)  # normalize vector
+        embeddings.append(vec)
+    return embeddings
 
-    answers = []
-    for question in request.questions:
-        result = qa_chain({"query": question})
-        answers.append(result["result"])
+# ---- FAISS Indexing ----
+def build_faiss_index(chunks: List[str]):
+    embeddings = get_embeddings(chunks)
+    dim = len(embeddings[0])
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(embeddings).astype("float32"))
+    return index, chunks
 
-    return {"answers": answers}
+def search_faiss(index, query: str, chunks: List[str], k=10) -> List[str]:
+    query_embedding = get_embeddings([query])[0]
+    D, I = index.search(np.array([query_embedding]).astype("float32"), k)
+
+    retrieved = [(chunks[i], float(D[0][j])) for j, i in enumerate(I[0])]
+    # Sort by distance (lower is better)
+    reranked = sorted(retrieved, key=lambda x: x[1])
+    return [chunk for chunk, _ in reranked[:5]]  # top 5 after re-ranking
+
+# ---- Prompt Builder ----
+def build_prompt(question: str, context_chunks: List[str]) -> str:
+    context = "\n\n".join(context_chunks)
+    return f"""
+You are a legal assistant AI. Use the policy document context below to answer the question factually.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Respond in JSON format: {{"answer": "<your short, clear answer here>"}}
+"""
+
+# ---- LLM Call ----
+def ask_llm(prompt: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-nano-2025-04-14",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant. Always reply in JSON with an 'answer' key."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return json.dumps({"answer": f"Error generating answer: {str(e)}"})
+
+# ---- API Endpoint ----
+@app.post("/hackrx/run", response_model=QueryResponse)
+async def run_query(request: QueryRequest, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or malformed.")
+
+    token = authorization.split(" ")[1]
+    if token != TEAM_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token")
+    
+    if request.documents in faiss_cache:
+        index, chunk_list = faiss_cache[request.documents]
+    else:
+        document_text = await download_pdf_text(request.documents)
+        chunks = split_text_into_chunks(document_text)
+        index, chunk_list = build_faiss_index(chunks)
+        faiss_cache[request.documents] = (index, chunk_list)
+
+    try:
+        answers = []
+        for question in request.questions:
+            relevant_chunks = search_faiss(index, question, chunk_list)
+            prompt = build_prompt(question, relevant_chunks)
+            llm_output = ask_llm(prompt)
+
+            # ✅ Extract actual value from JSON response
+            try:
+                parsed = json.loads(llm_output)
+                answers.append(parsed.get("answer", llm_output))
+            except json.JSONDecodeError:
+                answers.append(llm_output)
+
+        return {"answers": answers}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
